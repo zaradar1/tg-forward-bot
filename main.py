@@ -256,6 +256,26 @@ _API_HASH = os.environ.get("API_HASH") or None
 # Bot token: prefer environment, but allow hardcoded fallback for quick local runs
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 
+# ── Shared worker account ────────────────────────────────────────────
+# One account that does the heavy uploads for every user, so nobody has to
+# /login just to receive a large file. It cannot post as the bot into a user's
+# chat, so it uploads into a private dump channel and the bot copies the
+# message out to the user — copying has no 50MB cap because the file already
+# lives on Telegram's servers.
+WORKER_API_ID   = _get_env_int("WORKER_API_ID", 0)
+WORKER_API_HASH = (os.environ.get("WORKER_API_HASH") or "").strip()
+WORKER_SESSION  = (os.environ.get("WORKER_SESSION") or "").strip()
+_DUMP_RAW       = (os.environ.get("DUMP_CHANNEL_ID") or "").strip()
+try:
+    DUMP_CHANNEL_ID: Optional[int] = int(_DUMP_RAW) if _DUMP_RAW else None
+except ValueError:
+    DUMP_CHANNEL_ID = None
+
+
+def worker_configured() -> bool:
+    return bool(WORKER_API_ID and WORKER_API_HASH and WORKER_SESSION and DUMP_CHANNEL_ID)
+
+
 # No global userbot accounts by default — use per-user credentials saved in the DB.
 USERBOT_ACCOUNTS: list[tuple[int, str]] = []
 DOWNLOAD_DIR  = tempfile.gettempdir()
@@ -278,7 +298,12 @@ RATE_LIMIT              = 5          # per 10 min (non-admin users)
 MAX_BOT_THREADS         = 10
 # Telegram Bot API hard cap for file uploads is ~500 MB — enforce safely
 CUTOFF_BLOCK_MB         = 500
-AUTO_SEND_LIMIT         = 500 * 1024 * 1024    # 500 MB — Telegram Bot API limit for direct uploads
+AUTO_SEND_LIMIT         = 500 * 1024 * 1024    # legacy ceiling used by the Terabox/Mega paths
+# A bot token may only upload 50 MB through the Bot API. The user's own
+# account (API_ID + hash + session) talks MTProto instead and reaches 2 GB,
+# so anything above the bot cap is uploaded by the userbot when one is linked.
+BOT_UPLOAD_LIMIT        = 50 * 1024 * 1024          # 50 MB  — Bot API hard cap
+USERBOT_UPLOAD_LIMIT    = 2 * 1024 * 1024 * 1024    # 2 GB   — MTProto cap
 AUTO_SCRAPER_SEND_LIMIT = 2 * 1024 * 1024 * 1024   # 2 GB
 MAX_CONCURRENT_TASKS    = 3
 COOLDOWN_SECONDS        = 20
@@ -1712,6 +1737,242 @@ def process_mega_link_sync(url: str) -> dict:
 
 
 # ══════════════════════════════════════════════════════════════════════
+# DIRECT LINK ENGINE  (any http(s) file URL, incl. Google Drive)
+# ══════════════════════════════════════════════════════════════════════
+#
+# Unlike the Terabox cascade this needs no third-party API: the bot simply
+# fetches the URL itself. That makes it the most reliable path, but it also
+# means the URL comes straight from a user, so every request is screened for
+# SSRF first (see _is_safe_public_url).
+
+GDRIVE_DOMAINS = ["drive.google.com", "docs.google.com", "drive.usercontent.google.com"]
+
+
+def is_gdrive_url(text: str) -> bool:
+    t = (text or "").strip().lower()
+    return t.startswith("http") and any(d in t for d in GDRIVE_DOMAINS)
+
+
+def _gdrive_file_id(url: str) -> Optional[str]:
+    """Pull the file id out of any of Google Drive's share-link shapes."""
+    for pat in (r"/file/d/([A-Za-z0-9_-]{10,})",
+                r"/d/([A-Za-z0-9_-]{10,})",
+                r"[?&]id=([A-Za-z0-9_-]{10,})"):
+        m = re.search(pat, url)
+        if m:
+            return m.group(1)
+    return None
+
+
+def _gdrive_direct_url(url: str) -> Optional[str]:
+    """Share link → direct download URL.
+
+    Uses the usercontent host with confirm=t, which serves the file straight
+    away instead of the 'virus scan warning' interstitial that the old
+    /uc?export=download endpoint returns for large files.
+    """
+    fid = _gdrive_file_id(url)
+    if not fid:
+        return None
+    return ("https://drive.usercontent.google.com/download"
+            f"?id={fid}&export=download&confirm=t")
+
+
+def _is_safe_public_url(url: str) -> tuple[bool, str]:
+    """Reject anything that is not a public http(s) address.
+
+    The bot runs with its token and cloud credentials in the environment, so a
+    user-supplied URL must never be able to reach loopback, private ranges or
+    the cloud metadata service (169.254.169.254) and have the body handed back.
+    """
+    import ipaddress
+    import socket
+
+    try:
+        p = urllib.parse.urlparse(url)
+    except Exception:
+        return False, "Malformed URL."
+    if p.scheme not in ("http", "https"):
+        return False, "Only http:// and https:// links are supported."
+    host = p.hostname
+    if not host:
+        return False, "URL has no host."
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except Exception:
+        return False, f"Cannot resolve host {host}."
+    for info in infos:
+        addr = info[4][0]
+        try:
+            ip = ipaddress.ip_address(addr)
+        except ValueError:
+            continue
+        if (ip.is_private or ip.is_loopback or ip.is_link_local
+                or ip.is_reserved or ip.is_multicast or ip.is_unspecified):
+            return False, "That address is not publicly routable."
+    return True, ""
+
+
+def _filename_from_headers(url: str, headers) -> str:
+    """Prefer Content-Disposition, fall back to the URL path."""
+    cd = headers.get("Content-Disposition") or headers.get("content-disposition") or ""
+    m = re.search(r"filename\*=(?:UTF-8'')?([^;]+)", cd, re.I) or \
+        re.search(r'filename="([^"]+)"', cd, re.I) or \
+        re.search(r"filename=([^;]+)", cd, re.I)
+    name = ""
+    if m:
+        name = urllib.parse.unquote(m.group(1).strip().strip('"'))
+    if not name:
+        path = urllib.parse.urlparse(url).path
+        name = urllib.parse.unquote(os.path.basename(path))
+    name = name.strip()
+    if not name or name in (".", ".."):
+        name = "file.bin"
+    return _clean_name(name, 90)
+
+
+# mimetypes is inconsistent across Python builds for these, so pin the ones
+# that decide how Telegram renders the upload.
+_MIME_EXT_OVERRIDES = {
+    "video/mp4": ".mp4", "video/x-matroska": ".mkv", "video/quicktime": ".mov",
+    "video/webm": ".webm", "video/x-msvideo": ".avi", "video/mpeg": ".mpeg",
+    "audio/mpeg": ".mp3", "audio/mp4": ".m4a", "audio/ogg": ".ogg",
+    "audio/flac": ".flac", "audio/x-wav": ".wav", "audio/wav": ".wav",
+    "image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp",
+    "image/gif": ".gif",
+    "application/zip": ".zip", "application/x-7z-compressed": ".7z",
+    "application/vnd.rar": ".rar", "application/x-rar-compressed": ".rar",
+    "application/pdf": ".pdf",
+    "application/vnd.android.package-archive": ".apk",
+}
+
+
+def _ensure_extension(filename: str, content_type: str) -> str:
+    """Give an extensionless name one derived from Content-Type.
+
+    Hosts like FileDitch serve files under opaque names with no extension, and
+    without one _detect_file_category treats a video as a generic document, so
+    it uploads without a player.
+    """
+    if os.path.splitext(filename)[1]:
+        return filename
+    ctype = (content_type or "").split(";")[0].strip().lower()
+    if not ctype or ctype == "application/octet-stream":
+        return filename
+    ext = _MIME_EXT_OVERRIDES.get(ctype)
+    if not ext:
+        import mimetypes
+        ext = mimetypes.guess_extension(ctype) or ""
+    return f"{filename}{ext}" if ext else filename
+
+
+_HTML_CTYPES = ("text/html", "application/xhtml+xml")
+
+_HTML_SNIFF_RE = re.compile(rb"^(?:<!doctype\s+html|<html|<head|<body|<script|<!--|<\?xml)", re.I)
+
+
+def _looks_like_html(chunk: bytes) -> bool:
+    """True when the first bytes of a body really are a web page.
+
+    Content-Type alone is not evidence: file hosts routinely label every
+    response text/html, so a genuine .rar would be refused on the header. The
+    bytes settle it.
+    """
+    if not chunk:
+        return False
+    head = chunk[:1024]
+    if head[:3] == b"\xef\xbb\xbf":
+        head = head[3:]
+    return bool(_HTML_SNIFF_RE.match(head.lstrip()))
+
+
+def _ctype_of(resp) -> str:
+    return (resp.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+
+
+def probe_direct_link(url: str) -> dict:
+    """Look up name / size / type without downloading the body.
+
+    Raises RuntimeError with a plain-text user-facing message when the URL is
+    unusable — the caller HTML-escapes it, so no markup here.
+    """
+    ok, why = _is_safe_public_url(url)
+    if not ok:
+        raise RuntimeError(why)
+
+    s = _make_resilient_session(retries=2)
+    hdrs = {"User-Agent": HEADERS.get("user-agent", "")}
+    resp = None
+    used_get = False
+    try:
+        try:
+            resp = s.head(url, headers=hdrs, allow_redirects=True, timeout=20)
+        except Exception:
+            resp = None
+        # A HEAD is only a hint. Many file hosts answer it with an error page,
+        # omit the length, or report text/html for a real download, so re-ask
+        # with GET whenever it looks unhelpful and judge from that response.
+        if (resp is None or resp.status_code >= 400
+                or not resp.headers.get("Content-Length")
+                or _ctype_of(resp) in _HTML_CTYPES):
+            if resp is not None:
+                try:
+                    resp.close()
+                except Exception:
+                    pass
+            resp = s.get(url, headers=hdrs, stream=True, allow_redirects=True, timeout=25)
+            used_get = True
+    except Exception as e:
+        raise RuntimeError(f"Could not reach the link: {e}") from e
+
+    try:
+        if resp.status_code >= 400:
+            raise RuntimeError(f"Server returned HTTP {resp.status_code}.")
+
+        # The final hop must still be public — redirects can leave the safe set.
+        ok, why = _is_safe_public_url(resp.url)
+        if not ok:
+            raise RuntimeError(f"Redirected to a blocked address. {why}")
+
+        ctype = _ctype_of(resp)
+        if ctype in _HTML_CTYPES:
+            sniff = b""
+            if used_get:
+                try:
+                    sniff = next(resp.iter_content(2048), b"") or b""
+                except Exception:
+                    sniff = b""
+            if not used_get or _looks_like_html(sniff):
+                raise RuntimeError(
+                    "That link returns a web page, not a file.\n"
+                    "Send the direct file link — the one that starts the download."
+                )
+            # Mislabelled: the bytes are a file. Drop the bogus type so the
+            # name and extension decide how it is sent.
+            log.info(f"[direct link] {url[:80]} says {ctype} but the body is not HTML — accepting.")
+            ctype = ""
+
+        size = 0
+        cl = resp.headers.get("Content-Length")
+        if cl and str(cl).isdigit():
+            size = int(cl)
+
+        return {
+            "filename":   _ensure_extension(
+                              _filename_from_headers(str(resp.url), resp.headers),
+                              ctype),
+            "size":       size,
+            "size_human": human_size(size) if size else "Unknown",
+            "download":   str(resp.url),
+            "content_type": ctype or "application/octet-stream",
+        }
+    finally:
+        try:
+            resp.close()
+        except Exception:
+            pass
+
+# ══════════════════════════════════════════════════════════════════════
 # MULTI-API EXTRACTION SYSTEM
 # ══════════════════════════════════════════════════════════════════════
 #
@@ -2831,6 +3092,83 @@ def _progress_bar(done: int, total: int, width: int = 16) -> str:
     filled = int(width * pct)
     return "█" * filled + "░" * (width - filled) + f" {pct*100:.1f}%"
 
+def _fmt_eta(seconds: float) -> str:
+    """Compact duration: 45s / 3m 20s / 1h 04m."""
+    try:
+        s = int(max(0, seconds))
+    except Exception:
+        return "—"
+    if s < 60:
+        return f"{s}s"
+    if s < 3600:
+        return f"{s//60}m {s%60:02d}s"
+    return f"{s//3600}h {(s%3600)//60:02d}m"
+
+
+def _fmt_speed(bytes_per_sec: float) -> str:
+    if not bytes_per_sec or bytes_per_sec <= 0:
+        return "—"
+    return f"{human_size(int(bytes_per_sec))}/s"
+
+
+def render_progress(title: str, filename: str, done: int, total: int,
+                    elapsed: float) -> str:
+    """The live transfer panel shown while a file moves.
+
+    total may be 0 when the host sends no Content-Length, in which case the
+    bar and ETA are omitted rather than shown as a wrong 0%.
+    """
+    speed = (done / elapsed) if elapsed > 0 else 0
+    lines = [f"{title}\n", f"<code>{_esc(filename)}</code>\n"]
+    if total > 0:
+        pct = min(100.0, done * 100.0 / total)
+        filled = int(16 * pct / 100)
+        bar = "█" * filled + "░" * (16 - filled)
+        eta = ((total - done) / speed) if speed > 0 else 0
+        lines.append(f"<code>[{bar}] {pct:.1f}%</code>\n")
+        lines.append(f"📦 {human_size(done)} / {human_size(total)}\n")
+        lines.append(f"⚡ {_fmt_speed(speed)}  ·  ⏱ {_fmt_eta(elapsed)}"
+                     f"  ·  ⏳ {_fmt_eta(eta)} left")
+    else:
+        lines.append(f"📦 {human_size(done)} transferred\n")
+        lines.append(f"⚡ {_fmt_speed(speed)}  ·  ⏱ {_fmt_eta(elapsed)}")
+    return "".join(lines)
+
+
+class TransferProgress:
+    """Throttled progress panel — edits one Telegram message as bytes move.
+
+    Telegram rate-limits edits, so refresh no faster than every few seconds
+    and skip an edit when the rendered text has not changed.
+    """
+
+    def __init__(self, chat_id: int, msg_id: Optional[int], title: str,
+                 filename: str, total: int = 0, every: float = 4.0):
+        self.chat_id = chat_id
+        self.msg_id = msg_id
+        self.title = title
+        self.filename = filename
+        self.total = total
+        self.every = every
+        self.started = time.time()
+        self._last_edit = 0.0
+        self._last_text = ""
+
+    def elapsed(self) -> float:
+        return time.time() - self.started
+
+    def update(self, done: int, total: Optional[int] = None, force: bool = False) -> None:
+        if total:
+            self.total = total
+        now = time.time()
+        if not force and (now - self._last_edit) < self.every:
+            return
+        text = render_progress(self.title, self.filename, done, self.total, self.elapsed())
+        if text == self._last_text:
+            return
+        self._last_edit = now
+        self._last_text = text
+        _bot_edit(self.chat_id, self.msg_id, text)
 
 def _fetch_thumb(url: str) -> Optional[BytesIO]:
     if not url:
@@ -2913,30 +3251,61 @@ async def _async_download_to_disk(session, url, filename, total_size=0, dest_dir
         return None
 
 
-def _download_to_tempfile_sync(url: str, filename: str, dest_dir: str = DOWNLOAD_DIR, timeout: int = 120) -> Optional[str]:
-    """Synchronously download `url` to a temp file and return the path, or None."""
+class FileTooLargeError(Exception):
+    """Raised when a capped download exceeds max_bytes mid-stream."""
+
+
+def _download_to_tempfile_sync(url: str, filename: str, dest_dir: str = DOWNLOAD_DIR, timeout: int = 120,
+                               max_bytes: int = 0,
+                               referer: Optional[str] = "https://www.terabox.com/",
+                               progress: "Optional[TransferProgress]" = None) -> Optional[str]:
+    """Synchronously download `url` to a temp file and return the path, or None.
+
+    max_bytes > 0 aborts with FileTooLargeError once that many bytes arrive,
+    which is how a server that omits Content-Length is handled safely.
+    Pass referer=None for hosts unrelated to Terabox.
+    """
     dest_dir = dest_dir or tempfile.gettempdir()
     os.makedirs(dest_dir, exist_ok=True)
     fd, filepath = tempfile.mkstemp(prefix="tdl_sync_", suffix="_" + _clean_name(filename, 50), dir=dest_dir)
     os.close(fd)
     try:
-        headers = {"Referer": "https://www.terabox.com/", "User-Agent": HEADERS.get('user-agent', '')}
+        headers = {"User-Agent": HEADERS.get('user-agent', '')}
+        if referer:
+            headers["Referer"] = referer
         r = requests.get(url, stream=True, timeout=timeout, headers=headers)
-        if r.status_code == 403:
+        if r.status_code == 403 and referer:
             log.info("[sync dl_to_temp] Got 403 with Referer. Retrying without Referer...")
             headers.pop("Referer", None)
             r = requests.get(url, stream=True, timeout=timeout, headers=headers)
         with r:
             r.raise_for_status()
+            written = 0
+            if progress is not None:
+                cl = r.headers.get("Content-Length")
+                if cl and str(cl).isdigit():
+                    progress.total = int(cl)
             with open(filepath, 'wb') as f:
                 for chunk in r.iter_content(chunk_size=CHUNK_SIZE):
                     if chunk:
+                        written += len(chunk)
+                        if max_bytes and written > max_bytes:
+                            raise FileTooLargeError(f"exceeds {max_bytes} bytes")
                         f.write(chunk)
+                        if progress is not None:
+                            progress.update(written)
         # Ensure file is non-empty
         if os.path.getsize(filepath) == 0:
             os.remove(filepath)
             return None
         return filepath
+    except FileTooLargeError:
+        try:
+            if os.path.exists(filepath):
+                os.remove(filepath)
+        except Exception:
+            pass
+        raise
     except Exception as e:
         log.warning(f"[sync dl_to_temp] {e}")
         try:
@@ -3202,6 +3571,75 @@ async def resolve_entity(client: TelegramClient, identifier: str) -> Any:
     )
 
 
+_INVITE_RE = re.compile(r"(?:t\.me/|telegram\.me/)(?:joinchat/|\+)([A-Za-z0-9_-]+)")
+
+
+def _joinable_slug(identifier: str) -> Optional[str]:
+    """Public @username / t.me slug that JoinChannelRequest can take, else None.
+
+    A bare numeric ID is never joinable: the account holds no access_hash for a
+    chat it has not seen, so Telegram cannot resolve it.
+    """
+    ident = re.sub(r"^(?:https?://)?(?:t\.me/|telegram\.me/|@)", "",
+                   (identifier or "").strip()).strip("/")
+    if not ident or ident.lstrip("-").isdigit() or "/" in ident:
+        return None
+    return ident
+
+
+async def _ensure_joined(client: TelegramClient, identifier: str) -> Any:
+    """Resolve a chat, joining it first when the account is not a member yet.
+
+    /forward and friends need the account to actually be in the chat. If it is
+    not, and the user supplied an invite link or @username, join and resolve
+    again — a numeric ID cannot be joined, so that error is passed through.
+    """
+    from telethon.tl.functions.channels import JoinChannelRequest
+    from telethon.tl.functions.messages import ImportChatInviteRequest
+
+    try:
+        return await resolve_entity(client, identifier)
+    except Exception as first_err:
+        ident = str(identifier or "").strip()
+
+        invite = _INVITE_RE.search(ident)
+        if invite:
+            try:
+                log.info(f"[join] Not a member — importing invite {ident[:40]}…")
+                res = await client(ImportChatInviteRequest(invite.group(1)))
+                chats = getattr(res, "chats", None)
+                if chats:
+                    log.info(f"[join] Joined '{getattr(chats[0], 'title', '?')}'")
+                    return chats[0]
+            except Exception as e:
+                if "already" in str(e).lower():
+                    # Member after all — the first resolve just could not see it.
+                    try:
+                        return await resolve_entity(client, identifier)
+                    except Exception:
+                        pass
+                raise ValueError(
+                    f"Cannot join that invite link: {e}"
+                ) from e
+            raise first_err
+
+        slug = _joinable_slug(ident)
+        if slug:
+            try:
+                log.info(f"[join] Not a member — joining @{slug}…")
+                await client(JoinChannelRequest(slug))
+                return await resolve_entity(client, slug)
+            except Exception as e:
+                if "already" in str(e).lower():
+                    return await resolve_entity(client, slug)
+                raise ValueError(f"Cannot join @{slug}: {e}") from e
+
+        # Numeric ID and not a member: nothing we can do automatically.
+        raise ValueError(
+            f"{first_err}\n\nThis account is not in that chat. Send the "
+            f"<b>invite link</b> or <b>@username</b> instead of a numeric ID "
+            f"and it will be joined automatically."
+        )
 # ══════════════════════════════════════════════════════════════════════
 # SECTION 10 — BOT (pyTelegramBotAPI)
 # ══════════════════════════════════════════════════════════════════════
@@ -4018,8 +4456,15 @@ def _render_status_view(chat_id: int) -> tuple[str, InlineKeyboardMarkup]:
 def register_handlers(b: telebot.TeleBot) -> None:
 
     def _normalize_channel_input(text: str) -> str:
-        """Convert t.me links and @usernames to bare slugs for resolve_entity."""
+        """Convert t.me links and @usernames to bare slugs for resolve_entity.
+
+        Invite links are returned untouched: stripping them would drop the hash
+        (t.me/joinchat/<hash> used to come back as just "joinchat"), and that
+        hash is the only thing that can join a private chat.
+        """
         text = (text or "").strip()
+        if _INVITE_RE.search(text):
+            return text
         m = re.match(r"https?://t\.me/([^\s/?]+)", text)
         if m:
             return m.group(1)
@@ -4520,55 +4965,58 @@ def register_handlers(b: telebot.TeleBot) -> None:
         is_admin_user = _is_lx_auth(uid)
 
         user_help = (
-            "📖 <b>How to Use</b>\n\n"
-            "<b>🔗 Extract Terabox Links:</b>\n"
-            "Simply send any Terabox link and the bot will:\n"
-            "  ✅ Extract download URL\n"
-            "  ✅ Get stream links (360p, 480p, 720p, 1080p)\n"
-            "  ✅ Auto-send files ≤ 500MB\n"
-            "  ⚠️ Show download link for files > 500MB\n"
-            "  📊 Save to your history\n\n"
-            "<b>📝 Your Commands:</b>\n"
-            "<code>/start</code> — Welcome & info\n"
-            "<code>/help</code> — This message\n"
-            "<code>/stats</code> — View your stats\n"
-            "<code>/history</code> — Last 5 extractions\n"
-            "<code>/premium</code> — View premium plans\n"
-            "<code>/redeem &lt;code&gt;</code> — Activate premium\n\n"
-            "<b>⚡ Rate Limit:</b>\n"
-            f"📊 Normal users: {RATE_LIMIT} extractions per 10 minutes\n"
-            "💎 Premium users: Unlimited\n"
-            "🔐 Admins: Unlimited\n\n"
-            "<b>💎 Premium Features:</b>\n"
-            "✅ Unlimited extractions\n"
-            "✅ No rate limit\n"
-            "✅ Priority queue processing\n\n"
-            "<b>🤖 Userbot Tools:</b>\n"
-            "<code>/login</code> — Login to your Telegram account (Custom / String / Quick OTP)\n"
-            "<code>/login string</code> (or <code>/login_string</code>) — Login with StringSession directly\n"
-            "<code>/logout</code> — Log out (preserves session in database)\n"
-            "<code>/channels</code> — List all channels/groups\n"
-            "<code>/scraper</code> — Setup: scrape Terabox links & forward\n"
-            "<code>/download</code> — Setup: download media to disk\n"
-            "<code>/forward</code> — Setup: forward media between channels\n"
-            "<code>/gdrive_leech</code> — Setup: download files to Google Drive\n"
-            "<code>/github_login</code> — Setup: connect your GitHub account\n"
-            "<code>/github_leech</code> — Setup: upload files in chunks to GitHub\n"
-            "<code>/cron_start</code> — Start the background auto-leech daemon\n"
-            "<code>/cron_stop</code> — Stop the background auto-leech daemon\n"
-            "<code>/multi_target</code> — Configure multi-channel routing sources\n"
-            "<code>/mega_bypass</code> — Enable Mega/Terabox bypass hooks\n\n"
-            "<b>🎛 Job Control:</b>\n"
-            "<code>/pause (ps)</code> — Pause running job\n"
-            "<code>/resume (rm)</code> — Resume paused job\n"
-            "<code>/stop (so)</code> — Stop and discard job\n"
-            "<code>/status</code> — Show current job progress\n"
-            "<code>/cancel</code> — Cancel wizard setup\n\n"
-            "📤 <b>File Upload Policy:</b>\n"
-            "• Files ≤ 500MB → Auto-sent as document/video\n"
-            "• Files > 500MB → Download link sent\n"
-            "• HLS streams (M3U8) → Stream links only"
+            "📖 <b>COMMAND GUIDE</b>\n"
+            "──────────────────────\n\n"
+            "<b>🔗 DOWNLOAD A LINK — no command needed</b>\n"
+            "Paste the link and the bot does the rest:\n"
+            "<code>https://terabox.com/s/1AbCd…</code>\n"
+            "<code>https://mega.nz/file/xxxx#key</code>\n"
+            "<code>https://drive.google.com/file/d/ID/view</code>\n"
+            "<code>https://site.com/video.mp4</code>\n"
+            "→ Up to <b>2GB</b> lands here in chat with a live bar "
+            "(%, speed, ETA). Bigger = download button.\n"
+            "→ Send a <code>.txt</code> of Terabox links for bulk.\n"
+            "<code>/mega &lt;link&gt;</code> — same, for Mega\n\n"
+            "<b>👤 ACCOUNT</b>\n"
+            "<code>/start</code> — dashboard &amp; buttons\n"
+            "<code>/help</code> — this guide\n"
+            "<code>/id</code> — your user ID\n"
+            "<code>/stats</code> — your usage\n"
+            "<code>/history</code> — last 5 downloads\n"
+            "<code>/premium</code> — plans &amp; UPI\n"
+            "<code>/redeem PREM-XXXX</code> — activate a code\n\n"
+            "<b>🔑 LOGIN — only for the channel tools below</b>\n"
+            "<code>/login</code> — phone OTP, or pick a method\n"
+            "<code>/login string</code> — paste a StringSession\n"
+            "<code>/login force</code> — re-login\n"
+            "<code>/logout</code> — log out\n"
+            "<code>/channels</code> — list your channels + IDs\n"
+            "⚠️ OTP: send it spaced — <code>1 2 3 4 5</code>. "
+            "A plain <code>12345</code> is killed by Telegram.\n\n"
+            "<b>🤖 CHANNEL TOOLS</b> (need /login)\n"
+            "Not in the channel yet? Give the <b>invite link</b> or "
+            "<b>@username</b> — it joins automatically.\n"
+            "<code>/forward</code> — copy posts A → B\n"
+            "<code>/download</code> — save channel media to disk\n"
+            "<code>/scraper</code> — pull Terabox links &amp; forward\n"
+            "<code>/gdrive_leech</code> — leech to Google Drive\n\n"
+            "<b>🔁 /forward asks 5 things</b>\n"
+            "1 source · 2 destination · 3 how many to scan\n"
+            "4 <b>resume point</b> — last Msg ID, e.g. <code>27078</code>, "
+            "or <code>0</code> to auto/start fresh\n"
+            "5 media types\n"
+            "Albums stay grouped. Save the <b>🔖 Last msg ID</b> it shows — "
+            "after a redeploy type it at step 4 to continue.\n\n"
+            "<b>🎛 WHILE A JOB RUNS</b>\n"
+            "<code>/status</code> live progress · <code>/pause</code> · "
+            "<code>/resume</code> · <code>/stop</code> · <code>/cancel</code> wizard\n\n"
+            f"<b>⚡ LIMITS</b>  Free: {RATE_LIMIT}/10min · Premium: unlimited"
         )
+        if is_admin_user:
+            user_help += (
+                "\n\n<b>🎛️ Admin</b>\n"
+                "<code>/panel</code> — full admin command list"
+            )
         m = InlineKeyboardMarkup(row_width=2)
         m.add(
             InlineKeyboardButton("🏠 Main Dashboard", callback_data="ui_menu_main"),
@@ -4607,7 +5055,25 @@ def register_handlers(b: telebot.TeleBot) -> None:
             "<b>⚙️ Core Process Control:</b>\n"
             "<code>/checkpoint</code> — View/set checkpoints\n"
             "<code>/db_unlock</code> — Unlock database & clean duplicate instances\n"
+            "<code>/backup</code> — Back up DB &amp; sessions to Google Drive\n"
             "<code>/kill</code> — Force kill bot and stop all active tasks\n\n"
+            "<b>🔁 Forwarder Maintenance:</b>\n"
+            "<code>/reset_forward &lt;channel&gt;</code> — Clear a source's forward history\n"
+            "   e.g. <code>/reset_forward @my_source</code> — then use <code>0</code> at the resume step\n"
+            "<code>/skipfwd &lt;channel&gt; &lt;n&gt;</code> — Mark latest N posts as already sent\n"
+            "   e.g. <code>/skipfwd @my_source 135</code>\n"
+            "<code>/status</code> — Live job progress + last msg ID\n"
+            "<code>/pause</code> · <code>/resume</code> · <code>/stop</code> — Control the running job\n\n"
+            "<b>🛠 Worker Account (gives everyone 2GB):</b>\n"
+            "<code>/worker</code> — Is the worker online? Dump channel reachable?\n"
+            "<code>/joinchat &lt;link&gt;</code> — Worker joins a chat\n"
+            "   e.g. <code>/joinchat https://t.me/+AbCdEfGh</code> or <code>/joinchat @mychannel</code>\n"
+            "   ⚠️ A numeric ID cannot be joined — Telegram needs a link/username.\n"
+            "   Env needed: <code>WORKER_API_ID</code>, <code>WORKER_API_HASH</code>, "
+            "<code>WORKER_SESSION</code>, <code>DUMP_CHANNEL_ID</code>\n\n"
+            "<b>🩺 Diagnostics:</b>\n"
+            "<code>/apihealth</code> — Test all extraction endpoints\n"
+            "<code>/proxystatus</code> — Proxy pool status\n\n"
             "<b>👤 User Access Gatekeeper:</b>\n"
             "<code>/pending</code> — Show pending approval requests\n"
             "<code>/approve &lt;id&gt;</code> — Approve a user\n"
@@ -4623,7 +5089,8 @@ def register_handlers(b: telebot.TeleBot) -> None:
             "<code>/premiumcodes</code> — List all active license keys\n\n"
             "<b>🔑 Session Accounts:</b>\n"
             "<code>/list_accounts</code> — Show saved account sessions\n"
-            "<code>/show_account &lt;id&gt;</code> — Inspect session metadata\n\n"
+            "<code>/show_account &lt;id&gt;</code> — Inspect session metadata\n"
+            "<code>/user_channels &lt;id&gt;</code> — List that account's channels\n\n"
             f"{tier1_extra}"
         )
         b.send_message(message.chat.id, panel_text, parse_mode="HTML")
@@ -4928,6 +5395,7 @@ def register_handlers(b: telebot.TeleBot) -> None:
     def cmd_logout(message):
         uid = message.from_user.id
         _conv.pop(uid, None)
+        _clear_steps(message.chat.id)
         has_creds = logout_user(uid)
         if has_creds:
             b.reply_to(
@@ -5284,6 +5752,106 @@ def register_handlers(b: telebot.TeleBot) -> None:
             pass
         b.send_message(message.chat.id, text, parse_mode="HTML")
 
+    @b.message_handler(commands=["joinchat", "worker_join"])
+    def cmd_worker_join(message):
+        if not _is_lx_auth(message.from_user.id):
+            return b.reply_to(message, "⛔ Admin only.")
+        if not worker_configured():
+            return b.reply_to(
+                message,
+                "❌ Worker account is not configured.\n"
+                "Set <code>WORKER_API_ID</code>, <code>WORKER_API_HASH</code>, "
+                "<code>WORKER_SESSION</code> and <code>DUMP_CHANNEL_ID</code>.",
+                parse_mode="HTML")
+        parts = message.text.split()
+        if len(parts) < 2:
+            return b.reply_to(
+                message,
+                "ℹ️ <b>Usage:</b> <code>/joinchat &lt;invite link or @username&gt;</code>\n\n"
+                "A numeric ID cannot be joined — Telegram needs a link or username.",
+                parse_mode="HTML")
+        status = b.reply_to(message, "⏳ Joining…")
+        ok, why = _run_async(worker_join_link(parts[1])).result(timeout=120)
+        b.edit_message_text(
+            (f"✅ Worker {why}." if ok else f"❌ Could not join: <code>{_esc(why)}</code>"),
+            message.chat.id, status.message_id, parse_mode="HTML")
+
+    @b.message_handler(commands=["worker", "workerstatus"])
+    def cmd_worker_status(message):
+        if not _is_lx_auth(message.from_user.id):
+            return b.reply_to(message, "⛔ Admin only.")
+        if not worker_configured():
+            missing = [n for n, v in (("WORKER_API_ID", WORKER_API_ID),
+                                      ("WORKER_API_HASH", WORKER_API_HASH),
+                                      ("WORKER_SESSION", WORKER_SESSION),
+                                      ("DUMP_CHANNEL_ID", DUMP_CHANNEL_ID)) if not v]
+            return b.reply_to(
+                message,
+                "⚪ <b>Worker not configured.</b>\nMissing: <code>"
+                + "</code>, <code>".join(missing) + "</code>\n\n"
+                "Without it, files over 50MB need each user to <code>/login</code>.",
+                parse_mode="HTML")
+        status = b.reply_to(message, "⏳ Checking worker…")
+
+        async def _check():
+            c = await _get_worker_client()
+            if c is None:
+                return "❌ Worker session invalid or could not connect."
+            me = await c.get_me()
+            who = f"@{me.username}" if getattr(me, "username", None) else str(me.id)
+            try:
+                ent = await c.get_entity(DUMP_CHANNEL_ID)
+                dump = f"✅ <code>{_esc(getattr(ent, 'title', DUMP_CHANNEL_ID))}</code>"
+            except Exception as e:
+                dump = f"❌ cannot reach ({_esc(str(e))})"
+            return (f"🟢 <b>Worker online</b>\n\n"
+                    f"👤 Account: <code>{_esc(who)}</code>\n"
+                    f"🗄 Dump channel: {dump}\n"
+                    f"📦 Upload ceiling: <code>{USERBOT_UPLOAD_LIMIT/MB:.0f}MB</code>")
+
+        text = _run_async(_check()).result(timeout=120)
+        b.edit_message_text(text, message.chat.id, status.message_id, parse_mode="HTML")
+
+    @b.message_handler(commands=["reset_forward", "resetfwd", "reset"])
+    def cmd_reset_forward(message):
+        if not _is_lx_auth(message.from_user.id):
+            return b.reply_to(message, "⛔ Admin only.")
+
+        parts = message.text.split()
+        if len(parts) < 2:
+            return b.reply_to(
+                message,
+                "ℹ️ <b>Usage:</b> <code>/reset_forward &lt;source_channel&gt;</code>\n\n"
+                "Clears the saved forward history for that source so the next "
+                "<code>/forward</code> can send its posts again.\n"
+                "Example: <code>/reset_forward @my_source_channel</code>",
+                parse_mode="HTML",
+            )
+
+        src = parts[1]
+        try:
+            with _db_lock, get_db() as conn:
+                cur = conn.execute(
+                    "DELETE FROM processed_messages WHERE source=? AND task_type LIKE 'forward%'",
+                    (str(src),),
+                )
+                removed = cur.rowcount or 0
+                conn.execute(
+                    "DELETE FROM dl_progress WHERE src=? AND job_id LIKE 'fwd_%'",
+                    (str(src),),
+                )
+        except Exception as e:
+            return b.reply_to(message, f"❌ Reset failed: <code>{_esc(str(e))}</code>", parse_mode="HTML")
+
+        b.reply_to(
+            message,
+            f"🧹 <b>Forward history cleared</b> for <code>{_esc(src)}</code>.\n"
+            f"🗑 Removed <code>{removed}</code> processed-message record(s).\n\n"
+            f"Next <code>/forward</code> from this source starts fresh — at the resume step "
+            f"send <code>0</code> to begin from the first message.",
+            parse_mode="HTML",
+        )
+
     @b.message_handler(commands=["skipfwd", "skip"])
     def cmd_skip_fwd(message):
         if not _is_lx_auth(message.from_user.id):
@@ -5416,6 +5984,7 @@ def register_handlers(b: telebot.TeleBot) -> None:
     @b.message_handler(commands=["cancel"])
     def cmd_cancel(message):
         uid = message.from_user.id
+        _clear_steps(message.chat.id)
         if uid in _conv:
             _conv.pop(uid)
             b.reply_to(message, "❌ Wizard cancelled.")
@@ -5431,7 +6000,15 @@ def register_handlers(b: telebot.TeleBot) -> None:
         )
         return m
 
+    def _clear_steps(chat_id: int) -> None:
+        """Drop any pending next-step handlers for this chat so they cannot stack."""
+        try:
+            b.clear_step_handler_by_chat_id(chat_id)
+        except Exception:
+            pass
+
     def _start_login_flow(message):
+        _clear_steps(message.chat.id)
         msg = b.send_message(
             message.chat.id,
             "<b>🔐 Select Login Method:</b>\n\n"
@@ -5449,6 +6026,11 @@ def register_handlers(b: telebot.TeleBot) -> None:
         uid = call.from_user.id
         chat_id = call.message.chat.id
         mode = call.data.replace("login_mode_", "")
+
+        # The menu message already registered _login_choose_method as the next-step
+        # handler. Drop it, otherwise BOTH it and the handler we register below fire
+        # on the user's next message (double OTP requests, API_ID treated as phone).
+        _clear_steps(chat_id)
 
         existing_creds = _get_user_credentials(uid)
         default_api_id = _API_ID or (existing_creds[0] if existing_creds else None) or 39537854
@@ -5528,7 +6110,8 @@ def register_handlers(b: telebot.TeleBot) -> None:
 
         # Check if the user directly sent a phone number (+91..., 98..., etc.)
         clean_num = re.sub(r"[^\d+]", "", text)
-        if clean_num.startswith("+") or (clean_num.isdigit() and len(clean_num) >= 8):
+        # Require '+' or >=10 digits so an 8-digit API_ID is never mistaken for a phone.
+        if clean_num.startswith("+") or (clean_num.isdigit() and len(clean_num) >= 10):
             _conv[uid] = {
                 "mode": "login",
                 "api_id": default_api_id,
@@ -5759,6 +6342,11 @@ def register_handlers(b: telebot.TeleBot) -> None:
         phone = re.sub(r"[^\d+]", "", raw_phone)
         if uid not in _conv:
             _conv[uid] = {"mode": "login"}
+        if _conv[uid].get("task_running"):
+            # A login task is already polling for this user; never start a second
+            # one (two send_code_requests invalidate each other's codes).
+            return
+        _conv[uid]["task_running"] = True
         _conv[uid]["phone"] = phone
         _conv[uid]["otp"] = None
         _conv[uid]["password"] = None
@@ -5776,14 +6364,15 @@ def register_handlers(b: telebot.TeleBot) -> None:
         # so pyTelegramBotAPI correctly routes the user's reply to _login_got_otp.
         otp_prompt = b.send_message(
             message.chat.id,
-            "⏳ Requesting OTP from Telegram…\n\n"
-            "4️⃣ <b>OTP:</b> Once you receive it, reply with the code.\n\n"
-            "⚠️ <b>CRITICAL:</b> Never send the plain 5-digit code or forward Telegram's message — "
-            "Telegram instantly expires any code that appears in a sent message.\n"
-            "👉 Send it with a space between EVERY digit, like: <code>1 2 3 4 5</code>\n\n"
-            "(send /cancel to abort):",
+            "📩 <b>Sending OTP to your Telegram app…</b>\n\n"
+            "👉 <b>Reply with a SPACE between every digit:</b>\n"
+            "<code>1 2 3 4 5</code>\n\n"
+            "❌ <code>12345</code> (plain) → Telegram expires it instantly.\n"
+            "❌ Forwarding Telegram's message → same.\n\n"
+            "(/cancel to abort)",
             parse_mode="HTML"
         )
+        _clear_steps(message.chat.id)
         b.register_next_step_handler(otp_prompt, _login_got_otp)
         _run_async(_login_task(message.chat.id, uid, _conv[uid], _login_got_otp, _login_got_2fa_password))
 
@@ -6029,7 +6618,7 @@ def register_handlers(b: telebot.TeleBot) -> None:
             "🔁 <b>Media Forwarder Setup</b>\n\n"
             "Direction: <b>NEW channel → OLD channel</b>\n"
             "(Media from NEW is uploaded into OLD)\n\n"
-            "Step 1 / 4 — <b>SOURCE (NEW channel)</b>:\n" + _channel_hint(message.chat.id) +
+            "Step 1 / 5 — <b>SOURCE (NEW channel)</b>:\n" + _channel_hint(message.chat.id) +
             "\n\n<i>Send /cancel to abort.</i>",
             parse_mode="HTML",
         )
@@ -6043,7 +6632,7 @@ def register_handlers(b: telebot.TeleBot) -> None:
         _conv[uid]["src_label"] = label
         msg = b.send_message(
             message.chat.id,
-            "Step 2 / 4 — <b>DESTINATION (OLD channel)</b>:\n" + _channel_hint(message.chat.id),
+            "Step 2 / 5 — <b>DESTINATION (OLD channel)</b>:\n" + _channel_hint(message.chat.id),
             parse_mode="HTML",
         )
         b.register_next_step_handler(msg, _fwd_got_dst)
@@ -6056,7 +6645,7 @@ def register_handlers(b: telebot.TeleBot) -> None:
         _conv[uid]["dst_label"] = label
         msg = b.send_message(
             message.chat.id,
-            "Step 3 / 4 — How many messages to scan?\n"
+            "Step 3 / 5 — How many messages to scan?\n"
             "Send <code>0</code> or <code>all</code> for unlimited:",
             parse_mode="HTML",
         )
@@ -6083,7 +6672,41 @@ def register_handlers(b: telebot.TeleBot) -> None:
             )
             b.register_next_step_handler(msg, _fwd_got_limit)
             return
-        b.send_message(message.chat.id, "Step 4 / 4 — What to forward?",
+        msg = b.send_message(
+            message.chat.id,
+            "Step 4 / 5 — <b>Resume point</b>\n\n"
+            "Send the <b>last forwarded Msg ID</b> (e.g. <code>27078</code>) to continue right after it. "
+            "Everything after that ID is re-sent even if an earlier run already forwarded it.\n\n"
+            "Send <code>0</code> or <code>skip</code> to use the saved checkpoint, "
+            "or start from the first message if there is none.\n\n"
+            "<i>Tip: the previous run's status / completion message shows 🔖 Last msg ID.</i>",
+            parse_mode="HTML",
+        )
+        b.register_next_step_handler(msg, _fwd_got_start_id)
+
+    def _fwd_got_start_id(message):
+        uid = message.from_user.id
+        if _is_cancel(message): return _cancel_conv(b, message)
+        state = _conv.get(uid)
+        if not state or state.get("mode") != "forward":
+            b.send_message(message.chat.id, "This forward session expired. Send /forward to start again.")
+            return
+
+        txt = (message.text or "").strip().lower()
+        m = re.search(r"(\d+)\s*/?\s*$", txt)   # accepts "27078", "#27078", "https://t.me/c/…/27078"
+        if txt in ("", "0", "skip", "no", "none", "auto"):
+            state["start_after"] = 0
+        elif m:
+            state["start_after"] = int(m.group(1))
+        else:
+            msg = b.send_message(
+                message.chat.id,
+                "Please send a message ID (a number), or <code>0</code> / <code>skip</code>:",
+                parse_mode="HTML",
+            )
+            b.register_next_step_handler(msg, _fwd_got_start_id)
+            return
+        b.send_message(message.chat.id, "Step 5 / 5 — What to forward?",
                        reply_markup=_media_type_kb("ft"))
 
     @b.callback_query_handler(func=lambda c: c.data.startswith("ft_"))
@@ -6134,7 +6757,8 @@ def register_handlers(b: telebot.TeleBot) -> None:
             f"🎬 Videos: {'✅' if state['fwd_video'] else '❌'}\n"
             f"🎵 Audio:  {'✅' if state['fwd_audio'] else '❌'}  "
             f"📄 Docs:   {'✅' if state['fwd_doc'] else '❌'}\n"
-            f"📝 Captions: <code>{_esc(state['cap_mode'])}</code>\n\n"
+            f"📝 Captions: <code>{_esc(state['cap_mode'])}</code>\n"
+            f"🔖 Resume after: <code>{state.get('start_after') or 'auto (checkpoint / first message)'}</code>\n\n"
             "Use /pause (ps) /resume (rm) /stop (so) to control."
         )
         if bot:
@@ -6154,6 +6778,7 @@ def register_handlers(b: telebot.TeleBot) -> None:
             state["fwd_photo"], state["fwd_video"],
             state["fwd_audio"], state["fwd_doc"],
             state["cap_mode"], state.get("cap_prefix", ""),
+            state.get("start_after", 0) or 0,
         ))
 
     # ─── Terabox TXT file handler (Bulk Upload) ─────────────────
@@ -6359,15 +6984,174 @@ def register_handlers(b: telebot.TeleBot) -> None:
             enqueue_extraction(do_mega)
             return
 
+        # ── Any other http(s) link: fetch it directly (no third-party API) ──
         if not is_terabox_url(url):
-            return b.reply_to(
-                message,
-                "❓ Please send a valid <b>Terabox</b> or <b>Mega.nz</b> link.\n\n"
-                "Examples:\n"
-                "• <code>https://terabox.com/s/xxxxx</code>\n"
-                "• <code>https://mega.nz/file/xxxxx#key</code>",
-                parse_mode="HTML",
-            )
+            if not url.lower().startswith("http"):
+                return b.reply_to(
+                    message,
+                    "❓ Please send a valid link.\n\n"
+                    "Supported:\n"
+                    "• <b>Terabox</b> — <code>https://terabox.com/s/xxxxx</code>\n"
+                    "• <b>Mega.nz</b> — <code>https://mega.nz/file/xxxxx#key</code>\n"
+                    "• <b>Google Drive</b> — <code>https://drive.google.com/file/d/xxxxx/view</code>\n"
+                    "• Any <b>direct file link</b> — <code>https://site.com/video.mp4</code>",
+                    parse_mode="HTML",
+                )
+
+            allowed, wait = check_rate_limit(uid)
+            if not allowed:
+                mins, secs = divmod(wait, 60)
+                return b.reply_to(
+                    message,
+                    f"⏳ Rate limit reached! Try again in <code>{mins}m {secs}s</code>.\n\n"
+                    f"💎 Get unlimited access with /premium",
+                    parse_mode="HTML",
+                )
+
+            target = _gdrive_direct_url(url) if is_gdrive_url(url) else url
+            label  = "Google Drive" if is_gdrive_url(url) else "Direct link"
+            if target is None:
+                return b.reply_to(
+                    message,
+                    "❌ Could not read a file ID from that Google Drive link.\n"
+                    "Use the <b>share</b> link, e.g. "
+                    "<code>https://drive.google.com/file/d/FILE_ID/view</code>",
+                    parse_mode="HTML",
+                )
+
+            premium_badge = " 💎" if is_premium(uid) else ""
+            status = b.reply_to(message, f"🔗 <b>Checking {label}…</b>{premium_badge}", parse_mode="HTML")
+
+            def do_direct():
+                try:
+                    info = probe_direct_link(target)
+                    fname = info["filename"]
+                    size  = info["size"]
+                    _, type_label = _detect_file_category(fname)
+                    head = (f"✅ <b>{label} ready!</b>\n\n"
+                            f"📂 <b>File:</b> <code>{_esc(fname)}</code>\n"
+                            f"🏷 <b>Type:</b> <code>{type_label}</code>\n"
+                            f"📦 <b>Size:</b> <code>{_esc(info['size_human'])}</code>")
+
+                    markup = InlineKeyboardMarkup()
+                    markup.add(InlineKeyboardButton("⬇️ Download", url=info["download"]))
+
+                    # A bot token tops out at 50MB. The shared worker account
+                    # reaches 2GB for everyone; a personal login is the fallback
+                    # when no worker is configured.
+                    has_worker   = worker_configured()
+                    has_userbot  = has_worker or bool(_get_user_credentials(uid))
+                    cap = USERBOT_UPLOAD_LIMIT if has_userbot else BOT_UPLOAD_LIMIT
+
+                    if size > cap:
+                        hint = ("" if has_userbot else
+                                "\n💡 <code>/login</code> raises this to 2GB.")
+                        b.edit_message_text(
+                            head + f"\n\n⚠️ Over the {cap/MB:.0f}MB upload limit.{hint}"
+                                   "\n📥 Tap the button below.",
+                            message.chat.id, status.message_id,
+                            parse_mode="HTML", reply_markup=markup)
+                        increment_links(uid)
+                        save_history(uid, url, info)
+                        return
+
+                    # Some hosts omit Content-Length. Rather than refuse, pull the
+                    # file with a hard cap and fall back to the link if it trips.
+                    dl_prog = TransferProgress(
+                        message.chat.id, status.message_id,
+                        "📥 <b>Downloading…</b>", fname, total=size)
+                    dl_prog.update(0, force=True)
+                    try:
+                        path = _download_to_tempfile_sync(
+                            info["download"], fname, timeout=600,
+                            max_bytes=cap, referer=None, progress=dl_prog)
+                    except FileTooLargeError:
+                        hint = ("" if has_userbot else
+                                "\n💡 <code>/login</code> raises this to 2GB.")
+                        b.edit_message_text(
+                            head + f"\n\n⚠️ Bigger than {cap/MB:.0f}MB — too large to upload.{hint}"
+                                   "\n📥 Tap the button below.",
+                            message.chat.id, status.message_id,
+                            parse_mode="HTML", reply_markup=markup)
+                        increment_links(uid)
+                        save_history(uid, url, info)
+                        return
+                    if not path:
+                        b.edit_message_text(head + "\n\n❌ Download failed — try the button below.",
+                                            message.chat.id, status.message_id,
+                                            parse_mode="HTML", reply_markup=markup)
+                        return
+                    try:
+                        real_size = os.path.getsize(path)
+                        if real_size <= BOT_UPLOAD_LIMIT:
+                            b.edit_message_text(
+                                f"📤 <b>Uploading to Telegram…</b>\n\n<code>{_esc(fname)}</code>",
+                                message.chat.id, status.message_id, parse_mode="HTML")
+                            okay = _send_file_by_type(b, message.chat.id, path, fname, head,
+                                                      timeout=_send_timeout_for_size(real_size))
+                            if okay:
+                                increment_links(uid)
+                                save_history(uid, url, info)
+                                try: b.delete_message(message.chat.id, status.message_id)
+                                except Exception: pass
+                            else:
+                                b.edit_message_text(head + "\n\n❌ Upload failed — use the button below.",
+                                                    message.chat.id, status.message_id,
+                                                    parse_mode="HTML", reply_markup=markup)
+                        elif has_worker:
+                            # Worker uploads to the dump channel, bot copies it here.
+                            took = dl_prog.elapsed()
+                            ok_up, why = _run_async(
+                                worker_deliver_file(uid, path, fname, head,
+                                                    status.message_id)
+                            ).result(timeout=7200)
+                            if ok_up:
+                                increment_links(uid)
+                                save_history(uid, url, info)
+                                b.edit_message_text(
+                                    f"✅ <b>Done!</b>\n\n"
+                                    f"📂 <code>{_esc(fname)}</code>\n"
+                                    f"📦 {human_size(real_size)}\n"
+                                    f"⏱ Downloaded in {_fmt_eta(took)}",
+                                    message.chat.id, status.message_id, parse_mode="HTML")
+                            else:
+                                b.edit_message_text(
+                                    head + f"\n\n❌ Upload failed: <code>{_esc(why)}</code>"
+                                           "\n📥 Use the button below.",
+                                    message.chat.id, status.message_id,
+                                    parse_mode="HTML", reply_markup=markup)
+                        else:
+                            # No worker — fall back to the user's own account.
+                            ok_up, why = _run_async(
+                                _userbot_upload_file(uid, path, fname, head)
+                            ).result(timeout=3600)
+                            if ok_up:
+                                increment_links(uid)
+                                save_history(uid, url, info)
+                                b.edit_message_text(
+                                    head + f"\n\n✅ Sent to your <b>Saved Messages</b> "
+                                           f"({human_size(real_size)}).",
+                                    message.chat.id, status.message_id,
+                                    parse_mode="HTML", reply_markup=markup)
+                            else:
+                                b.edit_message_text(
+                                    head + f"\n\n❌ Userbot upload failed: <code>{_esc(why)}</code>"
+                                           "\n📥 Use the button below.",
+                                    message.chat.id, status.message_id,
+                                    parse_mode="HTML", reply_markup=markup)
+                    finally:
+                        _clean_file(path)
+                except Exception as e:
+                    log.error(f"[direct link] {e}")
+                    try:
+                        b.edit_message_text(f"❌ <b>Error:</b> {_esc(str(e))}",
+                                            message.chat.id, status.message_id, parse_mode="HTML")
+                    except Exception:
+                        pass
+
+            enqueue_extraction(do_direct)
+            return
+
         allowed, wait = check_rate_limit(uid)
         if not allowed:
             mins, secs = divmod(wait, 60)
@@ -6581,13 +7365,21 @@ def _is_cancel(message) -> bool:
 
 def _cancel_conv(b, message) -> None:
     _conv.pop(message.from_user.id, None)
+    try:
+        b.clear_step_handler_by_chat_id(message.chat.id)
+    except Exception:
+        pass
     b.reply_to(message, "❌ Operation cancelled.")
 
 
 def _channel_hint(chat_id: int) -> str:
+    tail = ("\n💡 Not a member yet? Send the <b>invite link</b> or <b>@username</b> "
+            "and it will be joined automatically (a numeric ID cannot be joined).")
     if _chat_cache.get(chat_id):
-        return "Enter the <b>row number</b> from the list, @username, or chat ID."
-    return "Enter @username or chat ID. Run /channels first to pick by number."
+        return ("Enter the <b>row number</b> from the list, @username, invite link, "
+                "or chat ID." + tail)
+    return ("Enter @username, an invite link, or a chat ID. "
+            "Run /channels first to pick by number." + tail)
 
 
 def _resolve_channel(chat_id: int, text: str) -> tuple[str, str]:
@@ -6636,15 +7428,27 @@ def run_bot() -> None:
     bot = _make_bot()
     try:
         bot.set_my_commands([
+            BotCommand("start", "Dashboard & main menu"),
             BotCommand("help", "Full command reference"),
+            BotCommand("login", "Connect your Telegram account"),
+            BotCommand("logout", "Log out (session kept)"),
             BotCommand("channels", "List all channels/groups"),
-            BotCommand("scraper", "Scrape Terabox links & forward"),
+            BotCommand("forward", "Forward posts between channels"),
             BotCommand("download", "Download media to disk"),
-            BotCommand("forward", "Forward media between channels"),
-            BotCommand("status", "Show current job progress"),
+            BotCommand("scraper", "Scrape Terabox links & forward"),
+            BotCommand("gdrive_leech", "Leech files to Google Drive"),
+            BotCommand("mega", "Download a Mega.nz link"),
+            BotCommand("status", "Job progress & last msg ID"),
             BotCommand("pause", "Pause current job"),
             BotCommand("resume", "Resume paused job"),
             BotCommand("stop", "Stop & discard current job"),
+            BotCommand("cancel", "Cancel the setup wizard"),
+            BotCommand("stats", "Your usage stats"),
+            BotCommand("history", "Last 5 extractions"),
+            BotCommand("premium", "Premium plans & payment"),
+            BotCommand("redeem", "Redeem a premium code"),
+            BotCommand("id", "Show your user ID"),
+            BotCommand("panel", "Admin control panel"),
         ])
     except Exception as e:
         log.warning(f"Could not set bot commands: {e}")
@@ -6819,6 +7623,10 @@ async def _login_task(chat_id: int, uid: int, state: dict, otp_callback, passwor
             def _reask_otp(text: str):
                 if bot and otp_callback:
                     m = bot.send_message(chat_id, text, parse_mode="HTML")
+                    try:
+                        bot.clear_step_handler_by_chat_id(chat_id)
+                    except Exception:
+                        pass
                     bot.register_next_step_handler(m, otp_callback)
                 else:
                     _bot_send(chat_id, text)
@@ -6873,6 +7681,10 @@ async def _login_task(chat_id: int, uid: int, state: dict, otp_callback, passwor
                     state["password"] = None
                     if bot and password_callback:
                         _pending = bot.send_message(chat_id, "⌨️ Waiting for your 2FA password…", parse_mode="HTML")
+                        try:
+                            bot.clear_step_handler_by_chat_id(chat_id)
+                        except Exception:
+                            pass
                         bot.register_next_step_handler(_pending, password_callback)
 
                     password = None
@@ -7025,6 +7837,186 @@ async def _admin_user_channels_task(admin_chat: int, status_msg_id: int, target_
                   f"\n📡 <b>Channels &amp; Groups</b> [{i+1}–{i+len(chunk)} of {len(rows)}]\n{body}")
 
 
+_worker_client: Optional[TelegramClient] = None
+_worker_lock: Optional[asyncio.Lock] = None
+
+
+def _get_worker_lock() -> asyncio.Lock:
+    global _worker_lock
+    if _worker_lock is None:
+        _worker_lock = asyncio.Lock()
+    return _worker_lock
+
+
+async def _get_worker_client() -> Optional[TelegramClient]:
+    """Connect the shared worker account once and reuse it.
+
+    One account means one rate-limit bucket, so jobs are serialised by the
+    caller holding _get_worker_lock() around a whole transfer.
+    """
+    global _worker_client
+    if not worker_configured():
+        return None
+    if _worker_client is not None and _worker_client.is_connected():
+        return _worker_client
+    try:
+        _worker_client = TelegramClient(
+            StringSession(WORKER_SESSION), WORKER_API_ID, WORKER_API_HASH,
+            connection_retries=5, auto_reconnect=True, timeout=60,
+        )
+        await _worker_client.connect()
+        if not await _worker_client.is_user_authorized():
+            log.error("[worker] WORKER_SESSION is not authorized — check the string session.")
+            await _worker_client.disconnect()
+            _worker_client = None
+            return None
+        me = await _worker_client.get_me()
+        log.info(f"[worker] Connected as {getattr(me, 'username', None) or me.id}")
+        return _worker_client
+    except Exception as e:
+        log.error(f"[worker] Connect failed: {e}")
+        _worker_client = None
+        return None
+
+
+async def worker_join_link(link: str) -> tuple[bool, str]:
+    """Join a channel from an invite link or @username with the worker account.
+
+    Only links and usernames can be joined: a bare numeric ID carries no
+    access_hash, so Telegram cannot resolve a chat the account is not in.
+    """
+    from telethon.tl.functions.channels import JoinChannelRequest
+    from telethon.tl.functions.messages import ImportChatInviteRequest
+
+    client = await _get_worker_client()
+    if client is None:
+        return False, "worker account is not configured"
+
+    link = (link or "").strip()
+    m = re.search(r"(?:t\.me/|telegram\.me/)(?:joinchat/|\+)([A-Za-z0-9_-]+)", link)
+    try:
+        if m:
+            await client(ImportChatInviteRequest(m.group(1)))
+            return True, "joined via invite link"
+        slug = re.sub(r"^(?:https?://)?(?:t\.me/|telegram\.me/|@)", "", link).strip("/")
+        if not slug or slug.lstrip("-").isdigit():
+            return False, ("a numeric ID cannot be joined — send an invite link "
+                           "or @username")
+        await client(JoinChannelRequest(slug))
+        return True, f"joined @{slug}"
+    except Exception as e:
+        msg = str(e)
+        if "already" in msg.lower():
+            return True, "already a member"
+        return False, msg
+
+
+async def worker_deliver_file(chat_id: int, file_path: str, filename: str,
+                              caption: str, status_msg_id: Optional[int]) -> tuple[bool, str]:
+    """Upload with the worker account, then have the bot copy it to the user.
+
+    The worker is a normal account, so it cannot post as the bot into the
+    user's chat. It uploads into the private dump channel instead and the bot
+    copies that message out — a copy references a file already on Telegram's
+    servers, so the 50MB upload cap does not apply.
+    """
+    client = await _get_worker_client()
+    if client is None:
+        return False, "worker account is not configured"
+
+    size = os.path.getsize(file_path)
+    category, _ = _detect_file_category(filename)
+    prog = TransferProgress(chat_id, status_msg_id, "📤 <b>Uploading to Telegram…</b>",
+                            filename, total=size)
+    loop = asyncio.get_event_loop()
+
+    def _cb(done, total):
+        # Editing a message is a blocking HTTP call; keep it off the loop.
+        try:
+            loop.run_in_executor(None, prog.update, done, total or size)
+        except Exception:
+            pass
+
+    async with _get_worker_lock():
+        try:
+            dump = await client.get_entity(DUMP_CHANNEL_ID)
+            sent = await client.send_file(
+                dump, file_path,
+                caption=f"{filename}\n<code>{chat_id}</code>",
+                parse_mode="html",
+                force_document=category not in ("video", "audio", "photo"),
+                supports_streaming=(category == "video"),
+                attributes=[tl_types.DocumentAttributeFilename(filename)],
+                progress_callback=_cb,
+            )
+        except errors.FloodWaitError as e:
+            return False, f"Telegram asked to wait {e.seconds}s"
+        except Exception as e:
+            log.error(f"[worker upload] {e}")
+            return False, str(e)
+
+    # Hand it to the user through the bot, which needs no re-upload.
+    try:
+        if bot is None:
+            return False, "bot is not running"
+        bot.copy_message(chat_id, DUMP_CHANNEL_ID, sent.id,
+                         caption=caption[:1024], parse_mode="HTML")
+        return True, "delivered"
+    except Exception as e:
+        log.error(f"[worker relay] {e}")
+        return False, f"uploaded but could not copy to you: {e}"
+
+async def _userbot_upload_file(chat_id: int, file_path: str, filename: str,
+                               caption: str = "") -> tuple[bool, str]:
+    """Upload a file with the user's own account instead of the bot token.
+
+    A bot may only push 50 MB through the Bot API; the linked account talks
+    MTProto and reaches 2 GB. The userbot *is* the user, so it cannot post as
+    the bot into this chat — the file goes to their Saved Messages, which they
+    can open from any device.
+
+    Returns (ok, message_for_the_user).
+    """
+    creds = _get_user_credentials(chat_id)
+    if not creds:
+        return False, "no linked account"
+    api_id, api_hash, session_string = creds
+    if not session_string:
+        return False, "no session string stored"
+
+    client = None
+    try:
+        client = _make_task_client(
+            api_id, api_hash, f"up_{chat_id}",
+            session_string=session_string,
+            connection_retries=3, auto_reconnect=True,
+        )
+        await client.connect()
+        if not await client.is_user_authorized():
+            return False, "session expired — run /login again"
+
+        category, _ = _detect_file_category(filename)
+        kwargs = {
+            "caption": caption[:1024] if caption else "",
+            "parse_mode": "html",
+            "force_document": category not in ("video", "audio", "photo"),
+            "supports_streaming": category == "video",
+            "attributes": [tl_types.DocumentAttributeFilename(filename)],
+        }
+        # "me" is Saved Messages for the account that owns this session.
+        await client.send_file("me", file_path, **kwargs)
+        return True, "sent to Saved Messages"
+    except errors.FloodWaitError as e:
+        return False, f"Telegram asked to wait {e.seconds}s"
+    except Exception as e:
+        log.error(f"[userbot upload] {e}")
+        return False, str(e)
+    finally:
+        if client is not None:
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
 async def _list_chats_task(chat_id: int, status_msg_id: int) -> None:
     creds = _get_user_credentials(chat_id)
     if not creds:
@@ -7145,12 +8137,12 @@ async def _scraper_task(
         primary = clients[0]
 
         try:
-            src_entity = await resolve_entity(primary, src)
+            src_entity = await _ensure_joined(primary, src)
         except Exception as e:
             _bot_send(chat_id, f"❌ Cannot resolve source `{_esc(src)}`: {_esc(str(e))}")
             return
         try:
-            dst_entity = await resolve_entity(primary, dst)
+            dst_entity = await _ensure_joined(primary, dst)
         except Exception as e:
             _bot_send(chat_id, f"❌ Cannot resolve dest `{_esc(dst)}`: {_esc(str(e))}")
             return
@@ -7386,7 +8378,7 @@ async def _downloader_task(
             _bot_edit(chat_id, status_msg_id, "❌ Session expired or revoked. Please run /login again.")
             return
         try:
-            entity      = await resolve_entity(client, src)
+            entity      = await _ensure_joined(client, src)
             folder_name = _clean_name(
                 getattr(entity, "title", None) or
                 getattr(entity, "username", None) or str(src), max_len=60
@@ -7621,6 +8613,7 @@ async def _forwarder_task(
     chat_id: int, src: str, dst: str, limit: Optional[int],
     fwd_photo: bool, fwd_video: bool, fwd_audio: bool, fwd_doc: bool,
     cap_mode: str, cap_prefix: str,
+    start_after: int = 0,
 ) -> None:
     creds = _get_user_credentials(chat_id)
     if not creds:
@@ -7643,8 +8636,8 @@ async def _forwarder_task(
             _bot_send(chat_id, "❌ Session expired or revoked. Please run /login again.")
             return
         try:
-            src_entity = await resolve_entity(client, src)
-            dst_entity = await resolve_entity(client, dst)
+            src_entity = await _ensure_joined(client, src)
+            dst_entity = await _ensure_joined(client, dst)
             src_title  = getattr(src_entity, "title", None) or str(src)
         except Exception as e:
             _bot_send(chat_id, f"❌ Cannot resolve: <code>{_esc(str(e))}</code>")
@@ -7653,7 +8646,7 @@ async def _forwarder_task(
         status_mid = _bot_send(chat_id, f"🔄 <b>Forwarding from {_esc(src_title)}…</b>\n⏳ Initializing high-speed direct stream…")
         dl_job_create(job_id, chat_id, src, f"Fwd: {src_title} -> {dst}", status_mid or 0, limit or 0)
 
-        skipped = dl_errors = sent = failed = processed = 0
+        skipped = dl_errors = sent = failed = processed = last_id = 0
         record     = _load_forward_record(src_title)
         total_ever = record.get("sent", 0)
 
@@ -7674,6 +8667,12 @@ async def _forwarder_task(
         except Exception as e:
             log.warning(f"[forwarder:{chat_id}] Checkpoint query failed: {e}")
 
+        # A resume ID typed by the user beats the DB checkpoint — the DB is wiped
+        # on every redeploy, so this is how a run picks up where the last one ended.
+        if start_after and start_after > 0:
+            dst_min_id = int(start_after)
+            log.info(f"[forwarder:{chat_id}] User resume point: skipping msg_id ≤ {dst_min_id}")
+
         if dst_min_id > 0:
             try:
                 probe = await client.get_messages(src_entity, limit=1, min_id=dst_min_id)
@@ -7690,221 +8689,216 @@ async def _forwarder_task(
                 job_clear(chat_id)
                 return
 
-            dedup_note = f"🔖 Resuming from checkpoint: Msg ID &gt; <code>{dst_min_id}</code>"
+            origin = "your input" if start_after else "saved checkpoint"
+            dedup_note = f"🔖 Resuming after Msg ID <code>{dst_min_id}</code> ({origin})"
         else:
             dedup_note = "🆕 High-speed direct forwarding active."
 
         _bot_edit(chat_id, status_mid,
                   f"🔄 <b>Forwarding from {_esc(src_title)}…</b>\n{dedup_note}")
 
-        async for msg in client.iter_messages(src_entity, limit=limit, min_id=dst_min_id, reverse=True):  # type: ignore
+        # ALL mode (every media type ticked) also carries text-only posts so the
+        # destination mirrors the source post-for-post.
+        forward_text = fwd_photo and fwd_video and fwd_audio and fwd_doc
 
-            ctrl = await _check_job_control(chat_id, job_id)
-            if ctrl == "stop":
-                _bot_send(chat_id, "⏹ Forwarder stopped by user.")
-                dl_job_update(job_id, sent, failed + dl_errors, msg.id, "stopped", "stopped")
-                break
-
-            media = msg.media
-            if not media:
-                skipped += 1; continue
-
-            if is_msg_processed(src, msg.id, task_scope) or is_msg_processed(src, msg.id, "forward"):
-                skipped += 1; continue
-
-            media_type = dest_path = None
-            mid = f"id{msg.id}"
-
-            if fwd_photo and isinstance(media, tl_types.MessageMediaPhoto):
-                media_type = "photo"
-                dest_path  = os.path.join(user_fwd_cache, f"{mid}_photo.jpg")
-            elif isinstance(media, tl_types.MessageMediaDocument):
+        def _classify(m):
+            """(media_type, ext) under the active filters, or (None, None)."""
+            media = m.media
+            if isinstance(media, tl_types.MessageMediaPhoto):
+                return ("photo", ".jpg") if fwd_photo else (None, None)
+            if isinstance(media, tl_types.MessageMediaDocument):
                 doc  = media.document
                 mime = getattr(doc, "mime_type", "") or ""
                 if fwd_video and mime.startswith("video/"):
-                    media_type = "video"
-                    dest_path  = os.path.join(user_fwd_cache, f"{mid}_video.mp4")
-                elif fwd_audio and mime.startswith("audio/"):
-                    ext  = ".ogg" if "ogg" in mime else ".mp3"
-                    media_type = "audio"
-                    dest_path  = os.path.join(user_fwd_cache, f"{mid}_audio{ext}")
-                elif fwd_doc and _is_real_document(doc):
+                    return "video", ".mp4"
+                if fwd_audio and mime.startswith("audio/"):
+                    return "audio", (".ogg" if "ogg" in mime else ".mp3")
+                if fwd_doc and _is_real_document(doc):
                     orig = "file.bin"
                     for attr in getattr(doc, "attributes", []):
                         if isinstance(attr, tl_types.DocumentAttributeFilename):
                             orig = getattr(attr, "file_name", orig); break
-                    ext  = os.path.splitext(orig)[1] or ".bin"
-                    media_type = "document"
-                    dest_path  = os.path.join(user_fwd_cache, f"{mid}_doc{ext}")
+                    return "document", (os.path.splitext(orig)[1] or ".bin")
+            return None, None
 
-            if not media_type or not dest_path:
-                skipped += 1; continue
-
-            original_cap = msg.message or ""
+        def _caption_for(m) -> str:
+            original = m.message or ""
             if cap_mode == "clear":
-                caption = ""
-            elif cap_mode == "prefix":
-                caption = cap_prefix + original_cap
-            else:
-                caption = original_cap
+                return ""
+            if cap_mode == "prefix":
+                return cap_prefix + original
+            return original
 
-            forwarded_direct = False
+        def _attrs_for(m, media_type, path=None):
+            media = m.media
+            if not isinstance(media, tl_types.MessageMediaDocument):
+                return None
+            attrs = getattr(media.document, "attributes", []) or []
+            if media_type == "video":
+                for a in attrs:
+                    if isinstance(a, tl_types.DocumentAttributeVideo):
+                        return [tl_types.DocumentAttributeVideo(
+                            duration=int(a.duration or 0), w=int(a.w or 0), h=int(a.h or 0),
+                            supports_streaming=True)]
+                return [tl_types.DocumentAttributeVideo(duration=0, w=0, h=0, supports_streaming=True)] if path else None
+            if media_type == "audio":
+                for a in attrs:
+                    if isinstance(a, tl_types.DocumentAttributeAudio):
+                        return [tl_types.DocumentAttributeAudio(
+                            duration=int(a.duration or 0), performer=a.performer or "", title=a.title or "")]
+                return None
+            if media_type == "document":
+                for a in attrs:
+                    if isinstance(a, tl_types.DocumentAttributeFilename):
+                        return [tl_types.DocumentAttributeFilename(str(a.file_name))]
+                return [tl_types.DocumentAttributeFilename(os.path.basename(str(path)))] if path else None
+            return None
 
-            # ── PRIORITY 1: DIRECT FORWARD (ZERO DOWNLOAD) ────────────────────
-            if cap_mode in ("keep", "default", "none"):
+        async def _send_group(group) -> str:
+            """Forward one post: a single message or a whole album (same grouped_id).
+            Returns 'sent' | 'skipped' | 'failed' | 'dlerr'."""
+            items = [(m, mt, ext) for m in group for mt, ext in [_classify(m)] if mt]
+            keep = cap_mode in ("keep", "default", "none")
+
+            # ── Text-only post ────────────────────────────────────────────────
+            if not items:
+                if not (forward_text and not any(m.media for m in group)):
+                    return "skipped"
+                m = group[0]
+                text = _caption_for(m)
+                if not text.strip():
+                    return "skipped"
+                for attempt in range(3):
+                    try:
+                        if keep:
+                            try:
+                                await client.forward_messages(dst_entity, m)
+                                return "sent"
+                            except (errors.ChatForwardsRestrictedError, errors.ChatAdminRequiredError):
+                                pass
+                        await client.send_message(dst_entity, text,
+                                                  formatting_entities=m.entities if keep else None,
+                                                  link_preview=False)
+                        return "sent"
+                    except errors.FloodWaitError as e:
+                        await _flood_wait(e.seconds)
+                    except Exception as e:
+                        log.warning(f"[fwd text] attempt {attempt+1}: {e}")
+                        await asyncio.sleep(1)
+                return "failed"
+
+            msgs = [m for m, _, _ in items]
+            # An album carries its caption on one member; take the first non-empty one.
+            caption = next((_caption_for(m) for m in msgs if (m.message or "").strip()),
+                           _caption_for(msgs[0]))
+            album = len(msgs) > 1
+            captions = [caption] + [""] * (len(msgs) - 1)   # album caption shown once
+
+            # ── PRIORITY 1: DIRECT FORWARD (keeps the album grouped) ──────────
+            if keep:
+                for attempt in range(3):
+                    try:
+                        await client.forward_messages(dst_entity, msgs)
+                        return "sent"
+                    except errors.FloodWaitError as e:
+                        await _flood_wait(e.seconds)
+                    except (errors.ChatForwardsRestrictedError, errors.ChatAdminRequiredError):
+                        break
+                    except Exception as e:
+                        log.debug(f"[fwd direct] attempt {attempt+1}: {e}")
+                        await asyncio.sleep(1)
+
+            # ── PRIORITY 2: CLOUD RE-SEND (no download, album preserved) ──────
+            for attempt in range(3):
                 try:
-                    for attempt in range(3):
-                        try:
-                            await client.forward_messages(dst_entity, msg)
-                            forwarded_direct = True
-                            sent += 1
-                            mark_msg_processed(src, msg.id, task_scope)
-                            break
-                        except errors.FloodWaitError as e:
-                            await _flood_wait(e.seconds)
-                        except (errors.ChatForwardsRestrictedError, errors.ChatAdminRequiredError):
-                            break
-                        except Exception as e:
-                            log.debug(f"[fwd direct] attempt {attempt+1}: {e}")
-                            await asyncio.sleep(1)
-                except Exception:
-                    forwarded_direct = False
-
-            # ── PRIORITY 2: DIRECT CLOUD MEDIA SEND (ZERO DOWNLOAD) ───────────
-            if not forwarded_direct:
-                try:
-                    for attempt in range(3):
-                        try:
-                            if media_type == "photo":
-                                await client.send_file(dst_entity, msg.media, caption=caption, allow_cache=False)
-                            elif media_type == "video":
-                                duration = width = height = None
-                                if isinstance(media, tl_types.MessageMediaDocument):
-                                    for attr in getattr(media.document, "attributes", []):
-                                        if isinstance(attr, tl_types.DocumentAttributeVideo):
-                                            duration, width, height = attr.duration, attr.w, attr.h
-                                attrs = [tl_types.DocumentAttributeVideo(
-                                    duration=int(duration or 0),
-                                    w=int(width or 0), h=int(height or 0),
-                                    supports_streaming=True,
-                                )] if (duration or width or height) else None
-                                await client.send_file(dst_entity, msg.media, caption=caption, attributes=attrs, allow_cache=False)
-                            elif media_type == "audio":
-                                duration = performer = title_tag = None
-                                if isinstance(media, tl_types.MessageMediaDocument):
-                                    for attr in getattr(media.document, "attributes", []):
-                                        if isinstance(attr, tl_types.DocumentAttributeAudio):
-                                            duration, performer, title_tag = attr.duration, attr.performer, attr.title
-                                attrs = [tl_types.DocumentAttributeAudio(
-                                    duration=int(duration or 0),
-                                    performer=performer or "",
-                                    title=title_tag or "",
-                                )] if (duration or performer or title_tag) else None
-                                await client.send_file(dst_entity, msg.media, caption=caption, attributes=attrs, allow_cache=False)
-                            else:
-                                file_name = None
-                                if isinstance(media, tl_types.MessageMediaDocument):
-                                    for attr in getattr(media.document, "attributes", []):
-                                        if isinstance(attr, tl_types.DocumentAttributeFilename):
-                                            file_name = getattr(attr, "file_name", file_name)
-                                attrs = [tl_types.DocumentAttributeFilename(str(file_name))] if file_name else None
-                                await client.send_file(dst_entity, msg.media, caption=caption, attributes=attrs, allow_cache=False)
-
-                            forwarded_direct = True
-                            sent += 1
-                            mark_msg_processed(src, msg.id, task_scope)
-                            break
-                        except errors.FloodWaitError as e:
-                            await _flood_wait(e.seconds)
-                        except (errors.ChatForwardsRestrictedError, errors.MediaEmptyError):
-                            break
-                        except Exception as e:
-                            log.debug(f"[fwd cloud] attempt {attempt+1}: {e}")
-                            await asyncio.sleep(1)
-                except Exception:
-                    forwarded_direct = False
-
-            # ── PRIORITY 3: FALLBACK STREAMING DOWNLOAD (PROTECTED CONTENT) ───
-            if not forwarded_direct:
-                try:
-                    path = None
-                    for attempt in range(3):
-                        try:
-                            path = await client.download_media(msg, file=dest_path)
-                            break
-                        except errors.FloodWaitError as e:
-                            await _flood_wait(e.seconds)
-                        except Exception as e:
-                            log.warning(f"[fwd dl] attempt {attempt+1}: {e}")
-                            await asyncio.sleep(2)
-
-                    if path and os.path.exists(path):
-                        duration = width = height = performer = title_tag = file_name = None
-                        if isinstance(media, tl_types.MessageMediaDocument):
-                            for attr in getattr(media.document, "attributes", []):
-                                if isinstance(attr, tl_types.DocumentAttributeVideo):
-                                    duration, width, height = attr.duration, attr.w, attr.h
-                                elif isinstance(attr, tl_types.DocumentAttributeAudio):
-                                    duration, performer, title_tag = attr.duration, attr.performer, attr.title
-                                elif isinstance(attr, tl_types.DocumentAttributeFilename):
-                                    file_name = getattr(attr, "file_name", file_name)
-
-                        try:
-                            for attempt in range(3):
-                                try:
-                                    if media_type == "photo":
-                                        await client.send_file(dst_entity, path, caption=caption, allow_cache=False)
-                                    elif media_type == "video":
-                                        attrs = [tl_types.DocumentAttributeVideo(
-                                            duration=int(duration or 0),
-                                            w=int(width or 0), h=int(height or 0),
-                                            supports_streaming=True,
-                                        )]
-                                        await client.send_file(dst_entity, path,
-                                                               caption=caption, attributes=attrs,
-                                                               force_document=False, allow_cache=False)
-                                    elif media_type == "audio":
-                                        attrs = [tl_types.DocumentAttributeAudio(
-                                            duration=int(duration or 0),
-                                            performer=performer or "",
-                                            title=title_tag or "",
-                                        )]
-                                        await client.send_file(dst_entity, path,
-                                                               caption=caption, attributes=attrs, allow_cache=False)
-                                    else:
-                                        attrs = [tl_types.DocumentAttributeFilename(
-                                            str(file_name or os.path.basename(str(path)))
-                                        )]
-                                        await client.send_file(dst_entity, path,
-                                                               caption=caption, attributes=attrs, allow_cache=False)
-                                    sent += 1
-                                    mark_msg_processed(src, msg.id, task_scope)
-                                    break
-                                except errors.FloodWaitError as e:
-                                    await _flood_wait(e.seconds)
-                                except Exception as e:
-                                    log.warning(f"[fwd ul] Attempt {attempt+1} failed: {e}")
-                                    if isinstance(e, (errors.FilePartsInvalidError, ConnectionError, OSError)):
-                                        try:
-                                            await client.disconnect()
-                                            await asyncio.sleep(2)
-                                            await client.connect()
-                                        except Exception:
-                                            pass
-                                    if attempt == 2: raise
-                                    await asyncio.sleep(3)
-                        except Exception as e:
-                            log.error(f"[fwd ul] {e}"); failed += 1
-                        finally:
-                            if CLEAN_AFTER_SEND:
-                                _clean_file(str(path))
+                    if album:
+                        await client.send_file(dst_entity, [m.media for m in msgs],
+                                               caption=captions, allow_cache=False)
                     else:
-                        dl_errors += 1
+                        m, mt, _ = items[0]
+                        await client.send_file(dst_entity, m.media, caption=caption,
+                                               attributes=_attrs_for(m, mt), allow_cache=False)
+                    return "sent"
+                except errors.FloodWaitError as e:
+                    await _flood_wait(e.seconds)
+                except (errors.ChatForwardsRestrictedError, errors.MediaEmptyError):
+                    break
                 except Exception as e:
-                    log.error(f"[fwd dl fallback] {e}"); dl_errors += 1
+                    log.debug(f"[fwd cloud] attempt {attempt+1}: {e}")
+                    await asyncio.sleep(1)
 
+            # ── PRIORITY 3: DOWNLOAD + UPLOAD (protected content) ─────────────
+            paths: list[str] = []
+            for m, mt, ext in items:
+                dest = os.path.join(user_fwd_cache, f"id{m.id}_{mt}{ext}")
+                path = None
+                for attempt in range(3):
+                    try:
+                        path = await client.download_media(m, file=dest)
+                        break
+                    except errors.FloodWaitError as e:
+                        await _flood_wait(e.seconds)
+                    except Exception as e:
+                        log.warning(f"[fwd dl] attempt {attempt+1}: {e}")
+                        await asyncio.sleep(2)
+                if not path or not os.path.exists(str(path)):
+                    if CLEAN_AFTER_SEND:
+                        for p in paths: _clean_file(p)
+                    return "dlerr"
+                paths.append(str(path))
+
+            try:
+                for attempt in range(3):
+                    try:
+                        if album:
+                            await client.send_file(dst_entity, paths, caption=captions,
+                                                   supports_streaming=True, allow_cache=False)
+                        else:
+                            m, mt, _ = items[0]
+                            await client.send_file(dst_entity, paths[0], caption=caption,
+                                                   attributes=_attrs_for(m, mt, paths[0]),
+                                                   force_document=(mt == "document"),
+                                                   supports_streaming=(mt == "video"),
+                                                   allow_cache=False)
+                        return "sent"
+                    except errors.FloodWaitError as e:
+                        await _flood_wait(e.seconds)
+                    except Exception as e:
+                        log.warning(f"[fwd ul] attempt {attempt+1}: {e}")
+                        if isinstance(e, (errors.FilePartsInvalidError, ConnectionError, OSError)):
+                            try:
+                                await client.disconnect()
+                                await asyncio.sleep(2)
+                                await client.connect()
+                            except Exception:
+                                pass
+                        if attempt == 2:
+                            raise
+                        await asyncio.sleep(3)
+            except Exception as e:
+                log.error(f"[fwd ul] {e}")
+                return "failed"
+            finally:
+                if CLEAN_AFTER_SEND:
+                    for p in paths: _clean_file(p)
+            return "failed"
+
+        async def _handle(group) -> None:
+            nonlocal sent, failed, dl_errors, skipped, processed, last_id
+            res = await _send_group(group)
+            if res == "sent":
+                sent += len(group)
+                for m in group:
+                    mark_msg_processed(src, m.id, task_scope)
+            elif res == "skipped":
+                skipped += len(group)
+            elif res == "dlerr":
+                dl_errors += 1
+            else:
+                failed += 1
             processed += 1
-            dl_job_update(job_id, sent, failed + dl_errors, msg.id, f"Msg {msg.id}")
+            last_id = group[-1].id
+            dl_job_update(job_id, sent, failed + dl_errors, last_id, f"Msg {last_id}")
             if processed % STATUS_UPDATE_INTERVAL == 0 and status_mid:
                 try:
                     _bot_edit(chat_id, status_mid,
@@ -7912,9 +8906,49 @@ async def _forwarder_task(
                               f"⚡ Direct Forward: <code>Active</code>\n"
                               f"✅ Sent: <code>{sent}</code>\n"
                               f"❌ Failed/Err: <code>{failed + dl_errors}</code>\n"
-                              f"⏭ Skipped: <code>{skipped}</code>")
+                              f"⏭ Skipped: <code>{skipped}</code>\n"
+                              f"🔖 Last msg ID: <code>{last_id}</code>")
                 except Exception:
                     pass
+
+        # Messages of one album share grouped_id and arrive consecutively when
+        # iterating in ascending order, so buffer them and flush as one post.
+        pending: list = []
+        pending_gid = None
+
+        async for msg in client.iter_messages(src_entity, limit=limit, min_id=dst_min_id, reverse=True):  # type: ignore
+
+            ctrl = await _check_job_control(chat_id, job_id)
+            if ctrl == "stop":
+                if pending:
+                    await _handle(pending); pending = []
+                _bot_send(chat_id,
+                          f"⏹ <b>Forwarder stopped.</b>\n"
+                          f"✅ Sent: <code>{sent}</code>\n"
+                          f"🔖 Last msg ID: <code>{last_id}</code>\n"
+                          f"<i>Send this ID at the resume step next time to continue from here.</i>")
+                dl_job_update(job_id, sent, failed + dl_errors, last_id or msg.id, "stopped", "stopped")
+                break
+
+            # An explicit resume ID is the user overriding history: forward
+            # everything after it, even if a previous run marked it processed.
+            if not start_after and (is_msg_processed(src, msg.id, task_scope)
+                                    or is_msg_processed(src, msg.id, "forward")):
+                if pending:
+                    await _handle(pending); pending = []; pending_gid = None
+                skipped += 1
+                continue
+
+            gid = getattr(msg, "grouped_id", None)
+            if pending and (gid is None or gid != pending_gid):
+                await _handle(pending); pending = []
+            if gid is not None:
+                pending.append(msg); pending_gid = gid
+            else:
+                await _handle([msg])
+
+        if pending:
+            await _handle(pending)
 
         record["sent"] = total_ever + sent
         _save_forward_record(src_title, record)
@@ -7929,8 +8963,12 @@ async def _forwarder_task(
                   f"🏁 <b>Forwarder complete!</b>\n"
                   f"✅ Sent: <code>{sent}</code>\n"
                   f"❌ Failed: <code>{failed}</code>\n"
-                  f"📦 Total ever forwarded: <code>{total_ever + sent}</code>")
-        dl_job_update(job_id, sent, failed + dl_errors, 0, "complete", "done")
+                  f"⏭ Skipped: <code>{skipped}</code>\n"
+                  f"🔖 Last msg ID: <code>{last_id or dst_min_id}</code>\n"
+                  f"📦 Total ever forwarded: <code>{total_ever + sent}</code>\n\n"
+                  f"<i>Save the Last msg ID — after a redeploy, enter it at the resume step "
+                  f"to continue from here.</i>")
+        dl_job_update(job_id, sent, failed + dl_errors, last_id or dst_min_id, "complete", "done")
 
     except Exception as e:
         log.error(f"[forwarder_task] {e}")
@@ -7958,7 +8996,7 @@ async def _skip_fwd_task(chat_id: int, src: str, count: int, status_msg_id: int)
             return
 
         try:
-            entity = await resolve_entity(client, src)
+            entity = await _ensure_joined(client, src)
             src_title = getattr(entity, "title", None) or str(src)
         except Exception as e:
             _bot_edit(chat_id, status_msg_id, f"❌ Cannot resolve source `{src}`: {e}")
